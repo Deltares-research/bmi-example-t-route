@@ -65,17 +65,17 @@ for details.
 
 - Adaptations to the existing BMI routing path, including the missing routing
   arguments needed by the example.
-- A standalone forcing-to-BMI smoke test using the same three-segment model
+- A standalone FEWS-BMI smoke test with lateral inflows, using the same three-segment model
   used in the Delft-FEWS integration.
 - A [test guide](test/fews-bmi-smoke-test/README.md) covering the model, input/output
   contract, and current limitations.
-- An [automated Ubuntu build and BMI test](.github/workflows/bmi-forcing-smoke.yml).
+- An [automated Ubuntu build and BMI test](.github/workflows/fews-bmi-smoke-test.yml).
 
 ## Run the model locally and in Delft-FEWS
 
 The [FEWS-BMI smoke-test folder](test/fews-bmi-smoke-test) contains the example
-model, forcing, configuration, and driver. Follow its
-[setup and run guide](test/fews-bmi-smoke-test/README.md#prerequisites)
+model, lateral inflows, configuration, and driver. Follow its
+[setup and run guide](test/fews-bmi-smoke-test/README.md#3-manually-compile-and-run-the-model)
 to build this fork and run the test without Delft-FEWS.
 
 **Delft-FEWS integration guide: to be added.** It will describe how to configure the
