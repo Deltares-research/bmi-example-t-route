@@ -241,6 +241,13 @@ velocity, and depth as columns.
 
 ### Build notes
 
+- **Required BMI routing fix:** this fork updates the `nwm_route` call in
+  [src/troute_model.py](../../src/troute_model.py) to pass three required
+  arguments: `great_lakes_df`, `great_lakes_param_df`, and
+  `great_lakes_climatology_df`. The function requires these arguments even
+  when the model has no Great Lakes. Without this fix, the BMI update fails
+  with a missing-arguments error. Include this source change when committing
+  or transferring the example; the test folder alone is not sufficient.
 - **BMI dependency:** `bmipy` is installed separately because it is not in
   `requirements.txt`.
 - **NetCDF dependencies:** Step 1 installs the native C/Fortran libraries;
