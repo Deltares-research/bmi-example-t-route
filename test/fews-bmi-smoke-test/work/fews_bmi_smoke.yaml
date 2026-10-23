@@ -1,0 +1,71 @@
+# One BMI instance for all three segments, with lateral inflows only.
+# Relative paths resolve from the working directory, which is this work/ folder,
+# as for the FEWS-BMI adaptor. In a Delft-FEWS deployment, geo_file_path may
+# instead point to the shared GeoPackage under Config/MapLayerFiles.
+bmi_parameters:
+  # Static field names expected by the BMI/network configuration.
+  # Geometry and channel attributes are read from the GeoPackage in this setup.
+  flowpath_columns:
+    - id
+    - toid
+    - lengthkm
+  attributes_columns:
+    - id
+    - rl_gages
+    - rl_NHDWaterbodyComID
+    - MusK
+    - MusX
+    - n
+    - So
+    - ChSlp
+    - BtmWdth
+    - nCC
+    - TopWdthCC
+    - TopWdth
+    - length_m
+  waterbody_columns: []
+  network_columns: []
+
+log_parameters:
+  showtiming: false
+  log_level: CRITICAL
+
+network_topology_parameters:
+  supernetwork_parameters:
+    # Also the geometry source for FEWS location sets and map layers.
+    # BMI uses numeric segment IDs (e.g. 10245), not downstream nexus IDs.
+    geo_file_path: gauge_01069700.gpkg
+    network_type: HYFeaturesNetwork
+  waterbody_parameters:
+    break_network_at_waterbodies: false
+
+compute_parameters:
+  # Route all segments internally; no split upstream/reservoir/downstream components.
+  parallel_compute_method: serial
+  compute_kernel: V02-structured
+  assume_short_ts: true
+  cpu_pool: 1
+  restart_parameters:
+    # Cold-start reference time, with no restart files supplied.
+    start_datetime: "2015-12-01_00:00:00"
+  forcing_parameters:
+    # Seconds per routing step; one BMI update() runs one step.
+    dt: 300
+    qts_subdivisions: 1
+    nts: 12
+    # Existing directory required by the shared validator, not an input source.
+    # Lateral inflows are supplied through BMI; no NEXOUT files are read here.
+    qlat_input_folder: .
+  data_assimilation_parameters:
+    streamflow_da:
+      streamflow_nudging: false
+      diffusive_streamflow_nudging: false
+    reservoir_da:
+      reservoir_persistence_da:
+        reservoir_persistence_usgs: false
+        reservoir_persistence_usace: false
+      reservoir_rfc_da:
+        reservoir_rfc_forecasts: false
+
+# No native T-Route output files configured: results are read through BMI.
+output_parameters: {}

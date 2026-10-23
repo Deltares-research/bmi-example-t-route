@@ -6,20 +6,45 @@ A smoke test is a small, quick check that the main parts of a system work
 together. Here it checks that a compiled T-Route model can initialize, accept
 lateral inflows through BMI, advance in time, and return routed results.
 
-The standalone Python driver substitutes for the **FEWS-BMI adaptor**, which
-is the coupling driver in Delft-FEWS. It uses the same three-segment model used
-in the Delft-FEWS integration, but runs without Delft-FEWS.
+The test is also the **model-side reference run** for the Delft-FEWS
+integration. The driver makes the same BMI calls as the **FEWS-BMI adaptor**
+(the coupling driver in Delft-FEWS), using the same folder layout, model
+configuration, and synthetic inputs. Running the same inputs through the
+adaptor and comparing its results with this test's output CSVs shows whether
+the adaptor exchanges data with the model correctly.
 
-The test checks the network size, input validity, clock advancement, output
-sizes, finite results, and some positive discharge. It is not a scientific
-validation, a numerical regression test, or an end-to-end Delft-FEWS test.
+Reading `run_info.xml`, reading and writing NetCDF, and writing `diag.xml` are
+adaptor responsibilities and are not part of this test.
+
+The test checks input validity, clock advancement, segment IDs, finite
+results, and some positive discharge. It is not a scientific validation or a
+numerical regression test.
 
 ## 2. Model contents, inputs, and outputs
 
+### Folder layout
+
+The folder follows the layout of the Delft-FEWS module folder used by the
+adaptor:
+
+| Path | Contents | Delft-FEWS / adaptor run |
+|---|---|---|
+| [input/lateral_inflows.csv](input/lateral_inflows.csv) | Synthetic lateral inflows | The same series, exported by Delft-FEWS as NetCDF |
+| [work/fews_bmi_smoke.yaml](work/fews_bmi_smoke.yaml) | T-Route BMI configuration | Model configuration in the ModuleDataSet |
+| [work/gauge_01069700.gpkg](work/gauge_01069700.gpkg) | Network geometry and channel attributes | Model geometry; source for location sets and map layers |
+| `output/` (generated, ignored by Git) | One result CSV per BMI output variable, plus CI logs | NetCDF results written by the adaptor |
+| [run_fews_bmi_smoke.py](run_fews_bmi_smoke.py) | BMI driver and test checks | Replaced by the FEWS-BMI adaptor |
+
+`work/` is the working directory for the model: the driver switches into it
+before `initialize`, as the adaptor does, so relative paths in the YAML resolve
+from `work/`. In a Delft-FEWS deployment, `geo_file_path` may instead point to
+the GeoPackage shared with the FEWS location sets, for example
+`../../../Config/MapLayerFiles/gauge_01069700.gpkg`.
+
 ### Model geometry and configuration
 
-The [GeoPackage](gauge_01069700.gpkg) contains three river flowpaths and no
-lakes. It is copied unchanged from the original T-Route
+The [GeoPackage](work/gauge_01069700.gpkg) contains three river flowpaths and
+no lakes. It is copied unchanged from the original T-Route
 [unit-test hydrofabric](../unit_test_hyfeature/domain/gauge_01069700.gpkg).
 
 ```text
@@ -30,28 +55,67 @@ flowpath 10245 -> flowpath 10236 -> flowpath 10237 -> terminal nexus 10238
 The total channel length is approximately 13.53 km. Channel geometry, slopes,
 and Manning roughness come from the GeoPackage.
 
-The [configuration](fews_bmi_smoke.yaml) uses:
+The [configuration](work/fews_bmi_smoke.yaml) uses:
 
 - One T-Route BMI instance for all three segments, with serial Muskingum-Cunge
-  routing (`V02-structured`). Unlike the split upstream/reservoir/downstream
-  BMI examples, this test has no separate model components or flow exchange
-  between instances; upstream and downstream segments are routed internally.
-  The standalone driver substitutes for the FEWS-BMI adaptor to supply lateral
-  inflows and read results from this one instance.
-- A 300-second timestep and twelve updates: one simulated hour.
-- A start time of December 1, 2015 at 00:00, with zero initial channel flow
-  and depth.
+  routing (`V02-structured`). Upstream and downstream segments are routed
+  internally; there is no flow exchange between separate model instances.
+- A 300-second time step (`dt`). Each `update()` advances the model by one
+  time step, so lateral inflows must be supplied every 5 minutes.
+- Zero initial channel flow and depth (cold start).
 - No reservoirs, data assimilation, or hybrid/diffusive routing.
 
-This model routes lateral inflow; it does not calculate rainfall-runoff.
-The example supplies a synthetic pulse of 0 to 3 m3/s to segment `10245`.
-Direct lateral inflows into `10236` and `10237` are zero, but water reaches
-these segments through routing.
+In BMI mode, the run length is set by the number of `update()` calls, not by
+`nts` or `start_datetime` in the YAML.
+
+### Time stepping
+
+The model's time step is `dt` in the YAML (300 s); a caller can read it with
+`get_time_step()`. The BMI caller controls the run:
+
+- **One input value per `update()`.** Each `update()` runs exactly one `dt`
+  with the lateral inflows last set through `set_value`. Inputs must therefore
+  be supplied at the model time step: 5-minute values for `dt: 300`. The
+  driver stops if the input spacing differs from `dt`.
+- **Run length.** The number of `update()` calls sets the run length. `nts`
+  and `start_datetime` in the YAML do not. `get_current_time()` returns the
+  elapsed model time in seconds since `initialize`, not a calendar date. The
+  caller turns it into dates (here: first input time + elapsed time).
+- **Coarser inputs.** For hourly inputs, either resample them to 5-minute
+  values before the run (as in this test), or set `dt: 3600`. A 1-hour
+  Muskingum-Cunge step on these short segments is less accurate: peaks are
+  smoothed and delayed. `assume_short_ts: true` is also intended for short
+  steps. Compare with a 300 s run before using a longer `dt`.
+- **Avoid `update_until()`.** In the current BMI wrapper:
+  - its argument is treated as a duration ("run this many more seconds"),
+    not an absolute model time as the BMI standard defines;
+  - with `qts_subdivisions: 1`, running more than one `dt` in a single call
+    fails, because one inflow value cannot cover several internal steps.
+
+  Use repeated `update()` calls instead.
+
+### Synthetic inputs
+
+[input/lateral_inflows.csv](input/lateral_inflows.csv) holds 12 hours of
+5-minute lateral inflows (144 values, 2025-01-01 00:00 to 11:55) in m3/s. It
+has a `time` column and one column per numeric segment ID:
+
+| Segment | Synthetic lateral inflow |
+|---|---|
+| `10245` | Constant 1.0 |
+| `10236` | 0.0 |
+| `10237` | 0.0 |
+
+All inflow enters the most upstream segment, so discharge from a cold start
+travels down `10245 -> 10236 -> 10237` and approaches 1.0 m3/s in every
+segment. If the coupling mixes up segment IDs, the inflow enters a downstream
+segment instead, and the upstream segments stay at zero discharge. This model
+routes lateral inflow; it does not calculate rainfall-runoff.
 
 ### BMI exchange and segment mapping
 
-The [local driver](run_fews_bmi_smoke.py) demonstrates the calls implemented by
-[T-Route's BMI wrapper](../../src/bmi_troute.py). The wrapper delegates model
+The [driver](run_fews_bmi_smoke.py) uses the calls implemented by
+[T-Route's BMI wrapper](../../src/bmi_troute.py), which delegates model
 execution to [troute_model.py](../../src/troute_model.py).
 
 | Direction | BMI variable | Meaning | Units |
@@ -63,7 +127,7 @@ execution to [troute_model.py](../../src/troute_model.py).
 | Output | `channel_water__mean_depth` | Channel water depth | m |
 
 GeoPackage flowpath names such as `wb-10245` become numeric BMI IDs such as
-`10245`. These are **segment IDs**, not nexus IDs. For this network:
+`10245`. These are **segment IDs**, not nexus IDs:
 
 | GeoPackage flowpath | BMI segment ID | Downstream nexus |
 |---|---|---|
@@ -71,71 +135,43 @@ GeoPackage flowpath names such as `wb-10245` become numeric BMI IDs such as
 | `wb-10236` | `10236` | `nex-10237` |
 | `wb-10237` | `10237` | `nex-10238` |
 
-For example, an input ID array `[10245, 10236, 10237]` with an inflow array
-`[1.0, 0.0, 0.0]` supplies 1 m3/s to segment `10245`. The ID and value arrays
-must use the same order. The local driver reads IDs from the GeoPackage and
-aligns its input data to that order.
-
 The exchange follows this sequence:
 
 ```python
-model.initialize(str(config_path))
+os.chdir("work")
+model.initialize("fews_bmi_smoke.yaml")
 model.set_value("land_surface_water_source__id", segment_ids)
-# Repeat for each 300-second interval:
+# For each 5-minute input value:
 model.set_value("land_surface_water_source__volume_flow_rate", lateral_inflows)
 model.update()
 discharge = model.get_value("channel_exit_water_x-section__volume_flow_rate")
 velocity = model.get_value("channel_water_flow__speed")
 depth = model.get_value("channel_water__mean_depth")
-
-# Outputs are pandas Series indexed by segment ID, not downstream nexus ID.
-# Output order need not match input order; identify values by their own indexes.
-output_segment_ids = discharge.index.to_numpy()
-q_10245 = discharge.loc[10245]  # Discharge at segment 10245's downstream exit.
-v_10245 = velocity.loc[10245]
-h_10245 = depth.loc[10245]
-# After the final interval:
+# After the last input value:
 model.finalize()
 ```
 
-Results are read at the **end** of each interval: 300, 600, ..., 3600 seconds.
-For example, lateral inflows supplied for 0-300 seconds produce results at
-300 seconds after the first `update()`. The next update produces results at
-600 seconds. Channel flow and depth carry over between updates in the same
-instance; the model is not reinitialized each time.
+Outputs are pandas Series indexed by segment ID. Their order need not match
+the input order, so identify values by their index (for example
+`discharge.loc[10245]`). The driver aligns them to the input order. T-Route
+silently ignores inflows for IDs outside its network, so the driver fails if
+an input ID is missing from the outputs.
 
-The local driver validates each output's segment index and reorders values to
-match the input segment IDs before writing results. Duplicate, missing, or
-unexpected IDs cause the test to fail, as do unindexed or non-finite outputs.
+### Output CSVs and time convention
 
-### Model files and their role in Delft-FEWS
+The driver writes one CSV per output variable to `output/`, named after the
+BMI variable, for example
+`output/channel_exit_water_x-section__volume_flow_rate.csv`. Each file has a
+`time` column and one column per segment ID, in the input order.
 
-| File | Local smoke test | Delft-FEWS |
-|---|---|---|
-| [gauge_01069700.gpkg](gauge_01069700.gpkg) | Network geometry and channel attributes | Model geometry; source for location sets and map layers |
-| [fews_bmi_smoke.yaml](fews_bmi_smoke.yaml) | T-Route BMI configuration | Model configuration in the ModuleDataSet |
-| [run_fews_bmi_smoke.py](run_fews_bmi_smoke.py) | BMI driver and test checks | Replaced by the FEWS-BMI adaptor |
-| [lateral_inflows.csv](lateral_inflows.csv) | Example lateral inflows | Replaced by NetCDF input |
-| [README.md](README.md) | Setup and model guide | Reference documentation |
-| `output/` (generated, ignored by Git) | Result CSV and CI logs | NetCDF model results written by the FEWS-BMI adaptor |
+The inflow at time *t* drives the step from *t* to *t* + 5 minutes, and the
+result is stamped at the **end** of the step. The input from 00:00 to 11:55
+therefore gives 144 results from 00:05 to 12:00. Channel flow and depth carry
+over between updates; the model is not reinitialized.
 
-This folder alone is not a complete Delft-FEWS deployment. The compiled
-T-Route environment, BMI source modules, FEWS-BMI adaptor, and FEWS
-configuration are also needed.
-
-When preparing the model for Delft-FEWS:
-
-- Use the model's segment IDs in the FEWS location mappings and configure
-  location sets and map layers using the GeoPackage geometry.
-- Update the YAML paths for the deployed working directory and align the
-  simulation start time with the FEWS run. Local paths are relative to the
-  repository root.
-- Configure NetCDF exchange through the FEWS-BMI adaptor. The standalone
-  driver and model YAML do not create NetCDF exchange files.
-
-Comments in the [model configuration](fews_bmi_smoke.yaml) explain the settings,
-including the validator-required `qlat_input_folder`; lateral inflows enter
-through BMI, not native NEXOUT files.
+When comparing with the adaptor, check that it uses the same time convention.
+If the adaptor stamps results at the start of the step, the series are
+shifted by one step.
 
 ### Boundary conditions and warm-state limitations
 
@@ -144,10 +180,8 @@ through BMI, not native NEXOUT files.
 - **No external boundaries in this setup:** upstream discharge and downstream/
   coastal water levels are not supplied or tested.
 - **Cold start:** nonzero initial state and save/restore across separate model
-  instances are not tested. State persists during this test's twelve updates,
-  but warm-restart equivalence has not been verified.
-- **No restart files:** the optional local results CSV is not a saved model
-  state.
+  instances are not tested.
+- **No restart files:** the output CSVs are not saved model state.
 
 These are limits of this setup and test, not all native T-Route capabilities.
 
@@ -217,7 +251,7 @@ The `no-e` option installs non-editable packages, matching CI.
 
 ### Step 4: Run the smoke test
 
-From the repository root, in the same activated environment:
+From any folder, in the same activated environment:
 
 ```bash
 python3 test/fews-bmi-smoke-test/run_fews_bmi_smoke.py
@@ -226,18 +260,11 @@ python3 test/fews-bmi-smoke-test/run_fews_bmi_smoke.py
 Expected success message:
 
 ```text
-FEWS-BMI smoke test passed: 3 segments, 12 updates, 300 seconds per update.
+FEWS-BMI smoke test passed: 3 segments, 144 updates, 300 seconds per update, results 2025-01-01 00:05:00 to 2025-01-01 12:00:00.
 ```
 
-Optionally save local results:
-
-```bash
-python3 test/fews-bmi-smoke-test/run_fews_bmi_smoke.py \
-  --output-csv test/fews-bmi-smoke-test/output/fews_bmi_smoke_output.csv
-```
-
-The CSV contains 36 rows: three segments at twelve timesteps, with discharge,
-velocity, and depth as columns.
+Results are written to `test/fews-bmi-smoke-test/output/`. Use `--input` for
+another inflow CSV and `--output-dir` for another output folder.
 
 ### Build notes
 
@@ -246,8 +273,7 @@ velocity, and depth as columns.
   arguments: `great_lakes_df`, `great_lakes_param_df`, and
   `great_lakes_climatology_df`. The function requires these arguments even
   when the model has no Great Lakes. Without this fix, the BMI update fails
-  with a missing-arguments error. Include this source change when committing
-  or transferring the example; the test folder alone is not sufficient.
+  with a missing-arguments error.
 - **BMI dependency:** `bmipy` is installed separately because it is not in
   `requirements.txt`.
 - **NetCDF dependencies:** Step 1 installs the native C/Fortran libraries;
@@ -262,38 +288,23 @@ velocity, and depth as columns.
 ## 4. GitHub build and test
 
 The [FEWS-BMI smoke-test workflow](../../.github/workflows/fews-bmi-smoke-test.yml)
-automates the build and local test on a fresh Ubuntu 22.04 runner with Python
-3.10. It:
+automates the build and test on a fresh Ubuntu 22.04 runner with Python 3.10.
+It:
 
 1. Installs native build tools, NetCDF-C, and NetCDF-Fortran.
 2. Installs Python requirements, `bmipy`, and `fiona`.
 3. Compiles T-Route with `bash ./compiler.sh no-e`.
-4. Runs the smoke test without `LD_LIBRARY_PATH` and saves its results CSV.
-5. Uploads build/test logs and the CSV as `fews-bmi-smoke-test-results`,
-   including available logs if a step fails.
+4. Runs the smoke test without `LD_LIBRARY_PATH`.
+5. Uploads build/test logs and the result CSVs as
+   `fews-bmi-smoke-test-results`, including available logs if a step fails.
 
-Commit and push the workflow, this test folder, and the required
-[BMI routing code](../../src/troute_model.py) changes. With Actions enabled
-in your fork, pushes and pull requests trigger the workflow. Manual execution
-through **Actions > FEWS-BMI smoke test > Run workflow** is available once the
-workflow is on the default branch.
+Pushes and pull requests trigger the workflow. Manual execution through
+**Actions > FEWS-BMI smoke test > Run workflow** is available once the
+workflow is on the default branch. Artifacts are retained for 14 days, and the
+job has a 30-minute timeout.
 
-Open the run to inspect build/test logs and download its artifact, retained
-for 14 days. The job has a 30-minute timeout. There is no separate result-
-coverage verification step; the driver's own checks determine test success.
-
-A successful run verifies that the tested revision builds and passes the
-standalone BMI smoke test in a fresh Ubuntu 22.04 / Python 3.10 environment,
-without relying on local packages or uncommitted files. This provides a
-reference setup that others should be able to reproduce on a matching system.
-Check the workflow result for the revision you use; the workflow's presence
-alone does not mean it has passed.
-
-This is not a guarantee for other operating systems or future dependency
-versions: WSL is not directly tested, and dependencies are not all pinned to
-exact versions. A passing test also does not establish scientific accuracy or
-bitwise-identical numerical results.
-
-This workflow does not run Delft-FEWS or its adaptor, validate NetCDF exchange,
-or reuse your local compiled environment. The original regional-model workflow
-is unchanged.
+The artifact's CSVs are the reference results to compare with an adaptor run
+of the same inputs. A successful run verifies that the tested revision builds
+and passes the BMI smoke test in a fresh Ubuntu 22.04 / Python 3.10
+environment. It does not guarantee results on other operating systems or
+future dependency versions, and it does not run Delft-FEWS or the adaptor.

@@ -61,11 +61,10 @@ jobs:
           bash ./compiler.sh no-e 2>&1 | tee test/fews-bmi-smoke-test/output/build.log
           python -m pip show troute.network troute.routing troute.config nwm_routing bmipy
 
-      - name: Run FEWS-BMI smoke test with lateral inflows
+      - name: Run FEWS-BMI smoke test with synthetic lateral inflows
         run: |
           unset LD_LIBRARY_PATH
           python test/fews-bmi-smoke-test/run_fews_bmi_smoke.py \
-            --output-csv test/fews-bmi-smoke-test/output/fews_bmi_smoke_output.csv \
             2>&1 | tee test/fews-bmi-smoke-test/output/smoke.log
 
       - name: Upload build logs and BMI results

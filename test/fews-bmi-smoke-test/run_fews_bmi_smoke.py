@@ -1,91 +1,88 @@
-"""Run the FEWS-BMI smoke test with segment lateral inflows."""
+"""Reference BMI run of the three-segment T-Route smoke model.
+
+Folder layout, matching the Delft-FEWS module folder used by the FEWS-BMI adaptor::
+
+    input/lateral_inflows.csv   synthetic lateral inflows (time + one column per segment ID)
+    work/                       T-Route BMI configuration and GeoPackage (working directory)
+    output/                     one CSV per BMI output variable (generated)
+
+The driver makes the same BMI calls as the adaptor, so its output CSVs can be
+compared with the adaptor's results for the same synthetic inputs.
+"""
 
 import argparse
 import os
 import sys
 from pathlib import Path
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+TEST_DIR = Path(__file__).resolve().parent
+REPO_ROOT = TEST_DIR.parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from bmi_troute import bmi_troute
 
 
-CONFIG_PATH = Path(__file__).resolve().with_name("fews_bmi_smoke.yaml")
-DEFAULT_LATERAL_INFLOW_PATH = Path(__file__).resolve().with_name("lateral_inflows.csv")
-NETWORK_PATH = Path(__file__).resolve().with_name("gauge_01069700.gpkg")
+WORK_DIR = TEST_DIR / "work"
+CONFIG_PATH = WORK_DIR / "fews_bmi_smoke.yaml"
+DEFAULT_INPUT = TEST_DIR / "input" / "lateral_inflows.csv"
+DEFAULT_OUTPUT_DIR = TEST_DIR / "output"
+INPUT_ID_VARIABLE = "land_surface_water_source__id"
+INPUT_FLOW_VARIABLE = "land_surface_water_source__volume_flow_rate"
 OUTPUT_VARIABLES = (
     "channel_exit_water_x-section__volume_flow_rate",
     "channel_water_flow__speed",
     "channel_water__mean_depth",
 )
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run the FEWS-BMI smoke test using lateral inflows only."
+        description="Run the T-Route smoke model through BMI with synthetic lateral inflows."
     )
     parser.add_argument(
-        "--lateral-inflow-csv",
+        "--input",
         type=Path,
-        default=DEFAULT_LATERAL_INFLOW_PATH,
-        help=(
-            "CSV with time_seconds and one column per numeric segment ID "
-            "in m3/s (default: bundled deterministic lateral inflows)."
-        ),
+        default=DEFAULT_INPUT,
+        help="CSV with a 'time' column and one column per numeric segment ID in m3/s.",
     )
     parser.add_argument(
-        "--output-csv",
+        "--output-dir",
         type=Path,
-        help="Optional path for writing per-step discharge, velocity, and depth.",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Folder for the result CSVs (default: output/).",
     )
     return parser.parse_args()
 
 
-def load_lateral_inflows(path, segment_ids, timestep_seconds):
-    inflows = pd.read_csv(path)
-    required_columns = {"time_seconds", *(str(segment_id) for segment_id in segment_ids)}
-    missing = required_columns.difference(inflows.columns)
-    if missing:
-        raise ValueError(f"Lateral-inflow CSV is missing required columns: {sorted(missing)}")
+def load_lateral_inflows(path):
+    inflows = pd.read_csv(path, parse_dates=["time"], index_col="time")
     if inflows.empty:
-        raise ValueError("Lateral-inflow CSV must contain at least one row.")
-
-    times = inflows["time_seconds"].to_numpy(dtype=np.int64)
-    expected_times = np.arange(len(inflows), dtype=np.int64) * timestep_seconds
-    if not np.array_equal(times, expected_times):
-        raise ValueError(
-            "time_seconds must start at zero and increase by the configured "
-            f"{timestep_seconds}-second timestep."
-        )
-
-    values = inflows[[str(segment_id) for segment_id in segment_ids]].to_numpy(dtype=float)
+        raise ValueError(f"{path} contains no rows.")
+    if not inflows.index.is_monotonic_increasing or not inflows.index.is_unique:
+        raise ValueError("Input times must be unique and increasing.")
+    segment_ids = np.asarray([int(column) for column in inflows.columns], dtype=np.int64)
+    values = inflows.to_numpy(dtype=float)
     if not np.isfinite(values).all():
-        raise ValueError("Lateral-inflow values must all be finite.")
+        raise ValueError("Lateral inflows must all be finite.")
     if (values < 0).any():
-        raise ValueError("This smoke test expects non-negative lateral inflows.")
-    return values
+        raise ValueError("Lateral inflows must be non-negative.")
+    return inflows.index, segment_ids, values
 
 
-def align_output(name, values, segment_ids):
+def check_output(name, values, segment_ids):
     if not isinstance(values, pd.Series):
         raise RuntimeError(f"{name} must return a Series indexed by segment ID.")
     if not values.index.is_unique:
         raise RuntimeError(f"{name} returned duplicate segment IDs.")
-
+    # T-Route silently ignores lateral inflows for IDs outside its network.
     missing = pd.Index(segment_ids).difference(values.index)
-    unexpected = values.index.difference(segment_ids)
-    if len(missing) or len(unexpected):
-        raise RuntimeError(
-            f"{name} returned mismatched segment IDs: "
-            f"missing={missing.tolist()}, unexpected={unexpected.tolist()}."
-        )
-
+    if len(missing):
+        raise RuntimeError(f"Input segment IDs not in the T-Route network: {missing.tolist()}")
     aligned = values.reindex(segment_ids).to_numpy(dtype=float)
     if not np.isfinite(aligned).all():
         raise RuntimeError(f"{name} contains non-finite values.")
@@ -94,75 +91,51 @@ def align_output(name, values, segment_ids):
 
 def main():
     args = parse_args()
-    os.chdir(REPO_ROOT)
+    times, segment_ids, values = load_lateral_inflows(args.input.resolve())
+    output_dir = args.output_dir.resolve()
 
-    flowpaths = gpd.read_file(NETWORK_PATH, layer="flowpaths")
-    lakes = gpd.read_file(NETWORK_PATH, layer="lake_attributes")
-    if len(flowpaths) != 3 or not lakes.empty:
-        raise RuntimeError(
-            "Expected the bundled toy hydrofabric to contain three flowpaths "
-            f"and no lakes; found {len(flowpaths)} flowpaths and {len(lakes)} lakes."
-        )
-
-    segment_ids = np.asarray(
-        [int(segment_id.rsplit("-", 1)[-1]) for segment_id in flowpaths["id"]],
-        dtype=np.int64,
-    )
-    inflow_values = load_lateral_inflows(args.lateral_inflow_csv, segment_ids, timestep_seconds=300)
-    if not np.any(inflow_values > 0):
-        raise ValueError("Lateral-inflow CSV must contain at least one positive lateral inflow.")
-
+    # Relative paths in the configuration resolve from the working directory.
+    os.chdir(WORK_DIR)
     model = bmi_troute()
     model.initialize(str(CONFIG_PATH))
-    model.set_value("land_surface_water_source__id", segment_ids)
-
-    output_rows = []
+    results = {name: [] for name in OUTPUT_VARIABLES}
     try:
-        for step, lateral_inflows in enumerate(inflow_values):
-            model.set_value(
-                "land_surface_water_source__volume_flow_rate",
-                lateral_inflows,
+        timestep = int(model.get_time_step())
+        spacing = np.diff(times.values).astype("timedelta64[s]").astype(np.int64)
+        if len(spacing) and not (spacing == timestep).all():
+            raise ValueError(
+                f"Input must be at the model time step of {timestep} s, one value per update()."
             )
+
+        model.set_value(INPUT_ID_VARIABLE, segment_ids)
+        for step, lateral_inflows in enumerate(values, start=1):
+            model.set_value(INPUT_FLOW_VARIABLE, lateral_inflows)
             model.update()
-
-            current_time = int(model.get_current_time())
-            if current_time != (step + 1) * 300:
+            if int(model.get_current_time()) != step * timestep:
                 raise RuntimeError(
-                    f"BMI time advanced to {current_time}s; expected {(step + 1) * 300}s."
+                    f"BMI time is {model.get_current_time()} s; expected {step * timestep} s."
                 )
-
-            outputs = {
-                name: align_output(name, model.get_value(name), segment_ids)
-                for name in OUTPUT_VARIABLES
-            }
-
-            for index, segment_id in enumerate(segment_ids):
-                output_rows.append(
-                    {
-                        "time_seconds": current_time,
-                        "segment_id": segment_id,
-                        "lateral_inflow_m3_s": lateral_inflows[index],
-                        "streamflow_m3_s": outputs[OUTPUT_VARIABLES[0]][index],
-                        "velocity_m_s": outputs[OUTPUT_VARIABLES[1]][index],
-                        "depth_m": outputs[OUTPUT_VARIABLES[2]][index],
-                    }
-                )
+            for name in OUTPUT_VARIABLES:
+                results[name].append(check_output(name, model.get_value(name), segment_ids))
     finally:
         model.finalize()
 
-    results = pd.DataFrame(output_rows)
-    if not np.any(results["streamflow_m3_s"].to_numpy() > 0):
-        raise RuntimeError("T-Route returned no positive streamflow for the positive lateral inflows.")
-    if args.output_csv:
-        args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-        results.to_csv(args.output_csv, index=False)
-        print(f"Wrote BMI results to {args.output_csv}")
+    # Input at time t drives the step t -> t + dt; results are stamped at the end of the step.
+    output_times = (times + pd.Timedelta(seconds=timestep)).strftime(TIME_FORMAT)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name, rows in results.items():
+        table = pd.DataFrame(rows, index=pd.Index(output_times, name="time"), columns=segment_ids)
+        table.to_csv(output_dir / f"{name}.csv")
+
+    discharge = np.asarray(results[OUTPUT_VARIABLES[0]])
+    if not (discharge > 0).any():
+        raise RuntimeError("T-Route returned no positive discharge for positive lateral inflows.")
 
     print(
-        f"FEWS-BMI smoke test passed: {len(segment_ids)} segments, "
-        f"{len(inflow_values)} updates, 300 seconds per update."
+        f"FEWS-BMI smoke test passed: {len(segment_ids)} segments, {len(values)} updates, "
+        f"{timestep} seconds per update, results {output_times[0]} to {output_times[-1]}."
     )
-    print(results.tail(len(segment_ids)).to_string(index=False))
+    print(f"Wrote {len(OUTPUT_VARIABLES)} result CSVs to {output_dir}")
 
 
 if __name__ == "__main__":
